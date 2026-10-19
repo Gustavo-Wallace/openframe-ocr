@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QSplitter,
     QVBoxLayout,
@@ -26,6 +27,7 @@ from PySide6.QtWidgets import (
 
 from openframe_ocr.camera import CameraWorker
 from openframe_ocr.document import Document
+from openframe_ocr.fields_panel import FieldsPanel
 from openframe_ocr.image_loader import MAX_PREVIEW_EDGE, load_preview
 from openframe_ocr.ocr import OCREngine, OCRWorker
 
@@ -167,9 +169,11 @@ class MainWindow(QMainWindow):
         preview_layout.setContentsMargins(0, 0, 0, 0)
         preview_layout.addWidget(QLabel("Pré-visualização"))
         self.preview = ImagePreview()
+        self.preview.setMinimumHeight(150)
         preview_layout.addWidget(self.preview, stretch=1)
 
         text_panel = QWidget()
+        text_panel.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         text_layout = QVBoxLayout(text_panel)
         text_layout.setContentsMargins(0, 0, 0, 0)
         text_layout.setSpacing(6)
@@ -185,16 +189,26 @@ class MainWindow(QMainWindow):
         self.text_edit = QPlainTextEdit()
         self.text_edit.setPlaceholderText("O texto extraído aparecerá aqui.")
         self.text_edit.setMinimumHeight(60)
+        self.text_edit.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Ignored)
         self.text_edit.textChanged.connect(self._text_edited)
         text_layout.addWidget(self.text_edit, stretch=1)
         self.ocr_status = QLabel()
         self.ocr_status.setWordWrap(True)
         text_layout.addWidget(self.ocr_status)
+        self.fields_panel = FieldsPanel()
+        self.fields_panel.expanded.connect(self._expand_fields_space)
+        text_layout.addWidget(self.fields_panel)
+        self.text_scroll = QScrollArea()
+        self.text_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.text_scroll.setWidgetResizable(True)
+        self.text_scroll.setWidget(text_panel)
+        self.text_scroll.setMinimumHeight(100)
 
         content_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.content_splitter = content_splitter
         content_splitter.setChildrenCollapsible(False)
         content_splitter.addWidget(preview_panel)
-        content_splitter.addWidget(text_panel)
+        content_splitter.addWidget(self.text_scroll)
         content_splitter.setStretchFactor(0, 1)
         content_splitter.setStretchFactor(1, 1)
         content_splitter.setSizes([240, 180])
@@ -206,6 +220,13 @@ class MainWindow(QMainWindow):
         layout.addLayout(workspace, stretch=1)
         self._update_removal_controls()
         self._show_document_text()
+
+    def resizeEvent(self, event: QResizeEvent) -> None:
+        super().resizeEvent(event)
+        extra_height = max(0, event.size().height() - self.minimumHeight())
+        self.preview.setMinimumHeight(min(150, 60 + extra_height // 2))
+        if self.fields_panel.toggle.isChecked():
+            QTimer.singleShot(0, self._expand_fields_space)
 
     @property
     def documents(self) -> tuple[Document, ...]:
@@ -291,7 +312,15 @@ class MainWindow(QMainWindow):
         document = self.current_document
         with QSignalBlocker(self.text_edit):
             self.text_edit.setPlainText(document.text if document else "")
+        self.fields_panel.set_document(document)
         self._update_ocr_controls()
+
+    def _expand_fields_space(self) -> None:
+        sizes = self.content_splitter.sizes()
+        total = sum(sizes)
+        preview_minimum = self.content_splitter.widget(0).minimumSizeHint().height()
+        text_size = max(0, min(max(sizes[1], 310), total - preview_minimum))
+        self.content_splitter.setSizes([total - text_size, text_size])
 
     def _update_ocr_controls(self) -> None:
         document = self.current_document
@@ -330,6 +359,10 @@ class MainWindow(QMainWindow):
         else:
             message = "Texto ainda não extraído."
         self.ocr_status.setText(message)
+        self.fields_panel.update_state(
+            available=not self._closing,
+            running=worker is not None and document is not None and worker.document_id == document.id,
+        )
 
     def _text_edited(self) -> None:
         document = self.current_document
