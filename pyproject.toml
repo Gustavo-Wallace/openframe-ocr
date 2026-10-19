@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openframe-ocr"
+version = "0.1.0"
+description = "Aplicativo desktop para extração local de texto de documentos e imagens."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["PySide6"]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

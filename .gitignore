@@ -1,0 +1,30 @@
+# Python e ambientes virtuais
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# Empacotamento
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+
+# Caches e arquivos temporários
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+.coverage
+htmlcov/
+*.log
+*.tmp
+*.temp
+*.swp
+*~
+.DS_Store
+Thumbs.db
