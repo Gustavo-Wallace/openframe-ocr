@@ -1,11 +1,12 @@
 """Janela principal com importação e pré-visualização de imagens locais."""
 
 from collections.abc import Iterable
+from dataclasses import dataclass
 import os
 from pathlib import Path
 
-from PySide6.QtCore import QSignalBlocker, Qt
-from PySide6.QtGui import QImage, QPixmap, QResizeEvent
+from PySide6.QtCore import QSignalBlocker, Qt, QTimer, Slot
+from PySide6.QtGui import QCloseEvent, QImage, QPixmap, QResizeEvent
 from PySide6.QtWidgets import (
     QFileDialog,
     QFrame,
@@ -21,7 +22,20 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from openframe_ocr.image_loader import load_preview
+from openframe_ocr.camera import CameraWorker
+from openframe_ocr.image_loader import MAX_PREVIEW_EDGE, load_preview
+
+
+MAX_CAPTURE_MEMORY_BYTES = 128 * 1024 * 1024
+
+
+@dataclass
+class Document:
+    """Arquivo original importado ou imagem da webcam mantida na sessão."""
+
+    name: str
+    path: Path | None = None
+    image: QImage | None = None
 
 
 class ImagePreview(QLabel):
@@ -39,6 +53,13 @@ class ImagePreview(QLabel):
         self.clear_image()
 
     def set_image(self, image: QImage) -> None:
+        if max(image.width(), image.height()) > MAX_PREVIEW_EDGE:
+            image = image.scaled(
+                MAX_PREVIEW_EDGE,
+                MAX_PREVIEW_EDGE,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
         self._source = QPixmap.fromImage(image)
         self._fit_image()
 
@@ -62,13 +83,22 @@ class ImagePreview(QLabel):
 
 
 class MainWindow(QMainWindow):
-    """Mantém os caminhos dos documentos e uma única prévia selecionada."""
+    """Apresenta documentos importados, capturas em memória e a prévia da webcam."""
 
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("OpenFrame OCR")
         self.resize(900, 600)
         self.setMinimumSize(640, 420)
+        self._camera: CameraWorker | None = None
+        self._camera_stopping = False
+        self._camera_error = ""
+        self._latest_frame: QImage | None = None
+        self._capture_count = 0
+        self._closing = False
+        self._frame_timer = QTimer(self)
+        self._frame_timer.setInterval(33)
+        self._frame_timer.timeout.connect(self._update_camera_preview)
 
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -97,8 +127,19 @@ class MainWindow(QMainWindow):
         actions.addWidget(self.import_button)
         self.webcam_button = QPushButton("Abrir webcam")
         self.webcam_button.setMinimumHeight(36)
-        self.webcam_button.setEnabled(False)
+        self.webcam_button.clicked.connect(self._start_camera)
         actions.addWidget(self.webcam_button)
+        self.capture_button = QPushButton("Capturar imagem")
+        self.capture_button.setMinimumHeight(36)
+        self.capture_button.setEnabled(False)
+        self.capture_button.clicked.connect(self._capture_image)
+        self.capture_button.hide()
+        actions.addWidget(self.capture_button)
+        self.close_camera_button = QPushButton("Fechar webcam")
+        self.close_camera_button.setMinimumHeight(36)
+        self.close_camera_button.clicked.connect(self._stop_camera)
+        self.close_camera_button.hide()
+        actions.addWidget(self.close_camera_button)
         actions.addStretch()
         layout.addLayout(actions)
 
@@ -139,17 +180,26 @@ class MainWindow(QMainWindow):
         self._update_removal_controls()
 
     @property
-    def document_paths(self) -> tuple[Path, ...]:
-        """Caminhos originais disponíveis para o processamento posterior."""
+    def documents(self) -> tuple[Document, ...]:
         return tuple(
-            Path(self.document_list.item(row).data(Qt.ItemDataRole.UserRole))
+            self.document_list.item(row).data(Qt.ItemDataRole.UserRole)
             for row in range(self.document_list.count())
         )
 
     @property
-    def current_document_path(self) -> Path | None:
+    def document_paths(self) -> tuple[Path, ...]:
+        """Caminhos originais disponíveis para o processamento posterior."""
+        return tuple(document.path for document in self.documents if document.path is not None)
+
+    @property
+    def current_document(self) -> Document | None:
         item = self.document_list.currentItem()
-        return Path(item.data(Qt.ItemDataRole.UserRole)) if item else None
+        return item.data(Qt.ItemDataRole.UserRole) if item else None
+
+    @property
+    def current_document_path(self) -> Path | None:
+        document = self.current_document
+        return document.path if document else None
 
     def _choose_images(self) -> None:
         paths, _ = QFileDialog.getOpenFileNames(
@@ -181,7 +231,7 @@ class MainWindow(QMainWindow):
                 errors.append(f"{path.name}: {error}")
                 continue
             item = QListWidgetItem(path.name)
-            item.setData(Qt.ItemDataRole.UserRole, str(path))
+            item.setData(Qt.ItemDataRole.UserRole, Document(path.name, path=path))
             item.setToolTip(str(path))
             self.document_list.addItem(item)
             known_paths.add(key)
@@ -194,16 +244,137 @@ class MainWindow(QMainWindow):
 
     def _show_selected(self) -> None:
         self._update_removal_controls()
-        path = self.current_document_path
-        if path is None:
+        if self._camera is not None and not self._camera_stopping:
+            return
+        document = self.current_document
+        if document is None:
             self.preview.clear_image()
             return
         self.preview.clear_image()
         try:
-            self.preview.set_image(load_preview(path))
+            image = document.image if document.image is not None else load_preview(document.path)
+            self.preview.set_image(image)
         except ValueError as error:
             self.preview.clear_image("Não foi possível carregar esta imagem.")
-            self._report_errors([f"{path.name}: {error}"])
+            self._report_errors([f"{document.name}: {error}"])
+
+    def _start_camera(self) -> None:
+        if self._camera is not None or self._closing:
+            return
+        self._camera_error = ""
+        self._camera_stopping = False
+        self._latest_frame = None
+        self._camera = CameraWorker(self)
+        self._camera.failed.connect(self._camera_failed, Qt.ConnectionType.QueuedConnection)
+        self._camera.finished.connect(self._camera_finished, Qt.ConnectionType.QueuedConnection)
+        self.webcam_button.setEnabled(False)
+        self.capture_button.setEnabled(False)
+        self.capture_button.show()
+        self.close_camera_button.setEnabled(True)
+        self.close_camera_button.show()
+        self.preview.clear_image("Abrindo webcam...")
+        self._camera.start()
+        self._frame_timer.start()
+
+    def _update_camera_preview(self) -> None:
+        if self._camera is None or self._camera_stopping:
+            return
+        image = self._camera.take_frame()
+        if image is not None:
+            self._latest_frame = image
+            self.preview.set_image(image)
+            self.capture_button.setEnabled(True)
+
+    def _capture_image(self) -> None:
+        if self._camera is None or self._camera_stopping or self._latest_frame is None:
+            return
+        image = self._camera.take_frame()
+        if image is None:
+            image = self._latest_frame
+        used_bytes = sum(
+            document.image.sizeInBytes()
+            for document in self.documents
+            if document.image is not None
+        )
+        if used_bytes + image.sizeInBytes() > MAX_CAPTURE_MEMORY_BYTES:
+            self._report_camera_error(
+                "O limite de memória para capturas foi atingido. "
+                "Remova capturas da lista antes de continuar."
+            )
+            return
+        self._capture_count += 1
+        name = f"Captura {self._capture_count}"
+        item = QListWidgetItem(name)
+        item.setData(Qt.ItemDataRole.UserRole, Document(name, image=image))
+        item.setToolTip("Captura da webcam mantida apenas nesta sessão.")
+        self.document_list.addItem(item)
+        self.document_list.setCurrentItem(item)
+        self._stop_camera()
+
+    def _stop_camera(self) -> None:
+        if self._camera is None or self._camera_stopping:
+            return
+        self._camera_stopping = True
+        self._frame_timer.stop()
+        self._camera.stop()
+        self._latest_frame = None
+        self.capture_button.setEnabled(False)
+        self.close_camera_button.setEnabled(False)
+        if self._closing:
+            self.preview.clear_image("Fechando webcam...")
+        else:
+            self._show_selected()
+
+    @Slot(str)
+    def _camera_failed(self, message: str) -> None:
+        if self.sender() is not self._camera or self._camera_stopping:
+            return
+        self._camera_error = message
+        self._stop_camera()
+
+    @Slot()
+    def _camera_finished(self) -> None:
+        worker = self._camera
+        if worker is None or self.sender() is not worker:
+            return
+        restore_preview = not self._camera_stopping
+        self._frame_timer.stop()
+        self._camera = None
+        self._latest_frame = None
+        self._camera_stopping = False
+        self.capture_button.setEnabled(False)
+        self.capture_button.hide()
+        self.close_camera_button.hide()
+        self.webcam_button.setEnabled(True)
+        worker.deleteLater()
+        if self._closing:
+            self.close()
+            return
+        if restore_preview:
+            self._show_selected()
+        if self._camera_error:
+            message = self._camera_error
+            self._camera_error = ""
+            self._report_camera_error(message)
+
+    def _report_camera_error(self, text: str) -> None:
+        message = QMessageBox(self)
+        message.setIcon(QMessageBox.Icon.Warning)
+        message.setWindowTitle("Webcam indisponível")
+        message.setTextFormat(Qt.TextFormat.PlainText)
+        message.setText(text)
+        message.addButton("Fechar", QMessageBox.ButtonRole.AcceptRole)
+        message.exec()
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        if self._camera is None:
+            event.accept()
+            return
+        # O encerramento aguarda a liberação pela própria thread, sem bloquear
+        # a interface nem destruir um QThread ainda em execução.
+        event.ignore()
+        self._closing = True
+        self._stop_camera()
 
     def _remove_selected(self) -> None:
         row = self.document_list.currentRow()

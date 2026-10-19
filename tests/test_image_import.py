@@ -66,7 +66,7 @@ def assert_empty(window):
     assert not window.remove_button.isEnabled()
     assert not window.clear_button.isEnabled()
     assert window.import_button.isEnabled()
-    assert not window.webcam_button.isEnabled()
+    assert window.webcam_button.isEnabled()
 
 
 def test_import_one_png_through_file_dialog(window, make_image, monkeypatch, messages):
@@ -91,7 +91,7 @@ def test_import_one_png_through_file_dialog(window, make_image, monkeypatch, mes
     assert preview_color(window) == QColor("red")
     assert window.remove_button.isEnabled()
     assert window.clear_button.isEnabled()
-    assert not window.webcam_button.isEnabled()
+    assert window.webcam_button.isEnabled()
     assert messages == []
 
 

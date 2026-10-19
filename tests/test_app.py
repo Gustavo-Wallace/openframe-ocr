@@ -16,6 +16,7 @@ def test_imports_do_not_create_application():
             "import openframe_ocr.app; "
             "import openframe_ocr.main_window; "
             "import openframe_ocr.image_loader; "
+            "import openframe_ocr.camera; "
             "import openframe_ocr.__main__; "
             "assert QApplication.instance() is None",
         ],
@@ -52,15 +53,17 @@ def test_initial_actions_have_correct_state(window, application):
     window.show()
     application.processEvents()
     buttons = window.findChildren(QPushButton)
-    assert {button.text() for button in buttons} == {
+    assert {button.text() for button in buttons if button.isVisible()} == {
         "Carregar imagens",
         "Abrir webcam",
         "Remover",
         "Limpar lista",
     }
-    assert len(buttons) == 4
-    assert all(button.isVisible() for button in buttons)
+    assert len(buttons) == 6
     assert window.import_button.isEnabled()
-    assert not window.webcam_button.isEnabled()
+    assert window.webcam_button.isEnabled()
+    assert not window.capture_button.isVisible()
+    assert not window.capture_button.isEnabled()
+    assert not window.close_camera_button.isVisible()
     assert not window.remove_button.isEnabled()
     assert not window.clear_button.isEnabled()
