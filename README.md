@@ -4,8 +4,6 @@ Aplicativo desktop open-source em Python para digitalização de documentos e ex
 
 ## Funcionalidades planejadas
 
-As funcionalidades abaixo estão planejadas e ainda não foram implementadas.
-
 - Captura de documentos pela webcam e importação de imagens PNG/JPEG.
 - OCR local com texto editável e campos copiáveis individualmente.
 - Análise opcional de nitidez, iluminação, contraste e legibilidade.

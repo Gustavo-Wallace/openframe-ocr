@@ -15,6 +15,7 @@ def test_imports_do_not_create_application():
             "import openframe_ocr; "
             "import openframe_ocr.app; "
             "import openframe_ocr.main_window; "
+            "import openframe_ocr.image_loader; "
             "import openframe_ocr.__main__; "
             "assert QApplication.instance() is None",
         ],
@@ -42,17 +43,24 @@ def test_initial_portuguese_labels(window):
         "OpenFrame OCR",
         "O aplicativo permitirá extrair texto de documentos e imagens localmente.",
         "Nenhum documento carregado",
-        "Carregamento de imagens e webcam ainda não disponíveis.",
+        "Documentos",
+        "Pré-visualização",
     }
 
 
-def test_unavailable_actions_are_visible_and_disabled(window, application):
+def test_initial_actions_have_correct_state(window, application):
     window.show()
     application.processEvents()
     buttons = window.findChildren(QPushButton)
     assert {button.text() for button in buttons} == {
         "Carregar imagens",
         "Abrir webcam",
+        "Remover",
+        "Limpar lista",
     }
-    assert len(buttons) == 2
-    assert all(button.isVisible() and not button.isEnabled() for button in buttons)
+    assert len(buttons) == 4
+    assert all(button.isVisible() for button in buttons)
+    assert window.import_button.isEnabled()
+    assert not window.webcam_button.isEnabled()
+    assert not window.remove_button.isEnabled()
+    assert not window.clear_button.isEnabled()
