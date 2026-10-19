@@ -8,7 +8,14 @@ version = "0.1.0"
 description = "Aplicativo desktop para extração local de texto de documentos e imagens."
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = ["PySide6", "opencv-python-headless"]
+dependencies = [
+    "PySide6",
+    "opencv-python-headless",
+    "numpy>=2,<3",
+    "rapidocr>=3.10,<4",
+    "onnxruntime",
+    "omegaconf>=2.4,<3",
+]
 
 [project.optional-dependencies]
 dev = ["pytest"]

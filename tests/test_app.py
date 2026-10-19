@@ -17,8 +17,13 @@ def test_imports_do_not_create_application():
             "import openframe_ocr.main_window; "
             "import openframe_ocr.image_loader; "
             "import openframe_ocr.camera; "
+            "import openframe_ocr.document; "
+            "import openframe_ocr.ocr; "
             "import openframe_ocr.__main__; "
-            "assert QApplication.instance() is None",
+            "assert QApplication.instance() is None; "
+            "import sys; "
+            "assert 'rapidocr' not in sys.modules; "
+            "assert 'onnxruntime' not in sys.modules",
         ],
         check=True,
         capture_output=True,
@@ -42,10 +47,11 @@ def test_initial_portuguese_labels(window):
     labels = {label.text() for label in window.findChildren(QLabel)}
     assert labels == {
         "OpenFrame OCR",
-        "O aplicativo permitirá extrair texto de documentos e imagens localmente.",
+        "Extraia texto de documentos e imagens localmente.",
         "Nenhum documento carregado",
         "Documentos",
         "Pré-visualização",
+        "Selecione um documento para extrair texto.",
     }
 
 
@@ -58,8 +64,10 @@ def test_initial_actions_have_correct_state(window, application):
         "Abrir webcam",
         "Remover",
         "Limpar lista",
+        "Extrair texto",
+        "Copiar texto",
     }
-    assert len(buttons) == 6
+    assert len(buttons) == 8
     assert window.import_button.isEnabled()
     assert window.webcam_button.isEnabled()
     assert not window.capture_button.isVisible()
@@ -67,3 +75,6 @@ def test_initial_actions_have_correct_state(window, application):
     assert not window.close_camera_button.isVisible()
     assert not window.remove_button.isEnabled()
     assert not window.clear_button.isEnabled()
+    assert not window.extract_button.isEnabled()
+    assert not window.copy_button.isEnabled()
+    assert not window.text_edit.isEnabled()

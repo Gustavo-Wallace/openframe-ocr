@@ -1,13 +1,13 @@
 """Janela principal com importação e pré-visualização de imagens locais."""
 
 from collections.abc import Iterable
-from dataclasses import dataclass
 import os
 from pathlib import Path
 
 from PySide6.QtCore import QSignalBlocker, Qt, QTimer, Slot
 from PySide6.QtGui import QCloseEvent, QImage, QPixmap, QResizeEvent
 from PySide6.QtWidgets import (
+    QApplication,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -16,26 +16,21 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QSizePolicy,
+    QSplitter,
     QVBoxLayout,
     QWidget,
 )
 
 from openframe_ocr.camera import CameraWorker
+from openframe_ocr.document import Document
 from openframe_ocr.image_loader import MAX_PREVIEW_EDGE, load_preview
+from openframe_ocr.ocr import OCREngine, OCRWorker
 
 
 MAX_CAPTURE_MEMORY_BYTES = 128 * 1024 * 1024
-
-
-@dataclass
-class Document:
-    """Arquivo original importado ou imagem da webcam mantida na sessão."""
-
-    name: str
-    path: Path | None = None
-    image: QImage | None = None
 
 
 class ImagePreview(QLabel):
@@ -48,7 +43,7 @@ class ImagePreview(QLabel):
         self.setWordWrap(True)
         self.setFrameShape(QFrame.Shape.StyledPanel)
         self.setContentsMargins(12, 12, 12, 12)
-        self.setMinimumSize(160, 120)
+        self.setMinimumSize(160, 60)
         self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
         self.clear_image()
 
@@ -96,6 +91,8 @@ class MainWindow(QMainWindow):
         self._latest_frame: QImage | None = None
         self._capture_count = 0
         self._closing = False
+        self._ocr_engine: OCREngine | None = None
+        self._ocr_worker: OCRWorker | None = None
         self._frame_timer = QTimer(self)
         self._frame_timer.setInterval(33)
         self._frame_timer.timeout.connect(self._update_camera_preview)
@@ -114,7 +111,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(heading)
 
         description = QLabel(
-            "O aplicativo permitirá extrair texto de documentos e imagens localmente."
+            "Extraia texto de documentos e imagens localmente."
         )
         description.setWordWrap(True)
         layout.addWidget(description)
@@ -172,12 +169,43 @@ class MainWindow(QMainWindow):
         self.preview = ImagePreview()
         preview_layout.addWidget(self.preview, stretch=1)
 
+        text_panel = QWidget()
+        text_layout = QVBoxLayout(text_panel)
+        text_layout.setContentsMargins(0, 0, 0, 0)
+        text_layout.setSpacing(6)
+        text_actions = QHBoxLayout()
+        self.extract_button = QPushButton("Extrair texto")
+        self.extract_button.clicked.connect(self._start_ocr)
+        text_actions.addWidget(self.extract_button)
+        self.copy_button = QPushButton("Copiar texto")
+        self.copy_button.clicked.connect(self._copy_text)
+        text_actions.addWidget(self.copy_button)
+        text_actions.addStretch()
+        text_layout.addLayout(text_actions)
+        self.text_edit = QPlainTextEdit()
+        self.text_edit.setPlaceholderText("O texto extraído aparecerá aqui.")
+        self.text_edit.setMinimumHeight(60)
+        self.text_edit.textChanged.connect(self._text_edited)
+        text_layout.addWidget(self.text_edit, stretch=1)
+        self.ocr_status = QLabel()
+        self.ocr_status.setWordWrap(True)
+        text_layout.addWidget(self.ocr_status)
+
+        content_splitter = QSplitter(Qt.Orientation.Vertical)
+        content_splitter.setChildrenCollapsible(False)
+        content_splitter.addWidget(preview_panel)
+        content_splitter.addWidget(text_panel)
+        content_splitter.setStretchFactor(0, 1)
+        content_splitter.setStretchFactor(1, 1)
+        content_splitter.setSizes([240, 180])
+
         workspace = QHBoxLayout()
         workspace.setSpacing(16)
         workspace.addWidget(documents_panel, stretch=1)
-        workspace.addWidget(preview_panel, stretch=3)
+        workspace.addWidget(content_splitter, stretch=3)
         layout.addLayout(workspace, stretch=1)
         self._update_removal_controls()
+        self._show_document_text()
 
     @property
     def documents(self) -> tuple[Document, ...]:
@@ -244,6 +272,7 @@ class MainWindow(QMainWindow):
 
     def _show_selected(self) -> None:
         self._update_removal_controls()
+        self._show_document_text()
         if self._camera is not None and not self._camera_stopping:
             return
         document = self.current_document
@@ -257,6 +286,131 @@ class MainWindow(QMainWindow):
         except ValueError as error:
             self.preview.clear_image("Não foi possível carregar esta imagem.")
             self._report_errors([f"{document.name}: {error}"])
+
+    def _show_document_text(self) -> None:
+        document = self.current_document
+        with QSignalBlocker(self.text_edit):
+            self.text_edit.setPlainText(document.text if document else "")
+        self._update_ocr_controls()
+
+    def _update_ocr_controls(self) -> None:
+        document = self.current_document
+        worker = self._ocr_worker
+        self.extract_button.setEnabled(
+            document is not None
+            and worker is None
+            and self._camera is None
+            and not self._closing
+        )
+        self.copy_button.setEnabled(
+            document is not None and bool(document.text.strip()) and not self._closing
+        )
+        self.text_edit.setEnabled(document is not None and not self._closing)
+        self.text_edit.setReadOnly(
+            worker is not None and document is not None and worker.document_id == document.id
+        )
+        if self._closing:
+            message = "Finalizando tarefas..."
+        elif worker is not None:
+            message = (
+                "Extraindo texto..."
+                if document is not None and worker.document_id == document.id
+                else "Extraindo texto de outro documento..."
+            )
+        elif document is None:
+            message = "Selecione um documento para extrair texto."
+        elif document.ocr_status == "error":
+            message = document.ocr_error
+        elif document.is_edited:
+            message = "Texto editado."
+        elif document.ocr_status == "completed":
+            message = "Texto extraído. Revise o resultado."
+        elif document.ocr_status == "empty":
+            message = "Nenhum texto detectado."
+        else:
+            message = "Texto ainda não extraído."
+        self.ocr_status.setText(message)
+
+    def _text_edited(self) -> None:
+        document = self.current_document
+        if document is not None:
+            document.text = self.text_edit.toPlainText()
+        self._update_ocr_controls()
+
+    def _copy_text(self) -> None:
+        if self.current_document is not None and self.text_edit.toPlainText().strip():
+            QApplication.clipboard().setText(self.text_edit.toPlainText())
+            self.ocr_status.setText("Texto copiado.")
+
+    def _confirm_replace_text(self) -> bool:
+        message = QMessageBox(self)
+        message.setWindowTitle("Substituir texto editado")
+        message.setIcon(QMessageBox.Icon.Question)
+        message.setText("Substituir o texto editado por uma nova extração?")
+        message.setInformativeText(
+            "As alterações serão substituídas somente se o OCR for concluído."
+        )
+        replace = message.addButton("Substituir texto", QMessageBox.ButtonRole.DestructiveRole)
+        cancel = message.addButton("Cancelar", QMessageBox.ButtonRole.RejectRole)
+        message.setDefaultButton(cancel)
+        message.setEscapeButton(cancel)
+        message.exec()
+        return message.clickedButton() is replace
+
+    def _start_ocr(self) -> None:
+        document = self.current_document
+        if (
+            document is None
+            or self._ocr_worker is not None
+            or self._camera is not None
+            or self._closing
+        ):
+            return
+        if document.is_edited and not self._confirm_replace_text():
+            return
+        if self.current_document is not document:
+            return
+        if self._ocr_engine is None:
+            self._ocr_engine = OCREngine()
+        document.ocr_status = "running"
+        document.ocr_error = ""
+        self._ocr_worker = OCRWorker(
+            document.id, document.path, document.image, self._ocr_engine, self
+        )
+        self._ocr_worker.finished.connect(self._ocr_finished, Qt.ConnectionType.QueuedConnection)
+        self._update_ocr_controls()
+        self._ocr_worker.start()
+
+    @Slot()
+    def _ocr_finished(self) -> None:
+        worker = self._ocr_worker
+        if worker is None or self.sender() is not worker:
+            return
+        self._ocr_worker = None
+        document = next(
+            (document for document in self.documents if document.id == worker.document_id), None
+        )
+        if document is not None:
+            if worker.result is not None:
+                document.recognized_text = worker.result.text
+                document.text = worker.result.text
+                document.ocr_status = worker.result.status
+            elif worker.error:
+                document.ocr_status = "error"
+                document.ocr_error = worker.error
+            else:
+                document.ocr_status = (
+                    "idle" if document.recognized_text is None
+                    else "completed" if document.recognized_text else "empty"
+                )
+        worker.deleteLater()
+        if self._closing:
+            self.close()
+            return
+        if document is not None and self.current_document is document:
+            self._show_document_text()
+        else:
+            self._update_ocr_controls()
 
     def _start_camera(self) -> None:
         if self._camera is not None or self._closing:
@@ -275,6 +429,7 @@ class MainWindow(QMainWindow):
         self.preview.clear_image("Abrindo webcam...")
         self._camera.start()
         self._frame_timer.start()
+        self._update_ocr_controls()
 
     def _update_camera_preview(self) -> None:
         if self._camera is None or self._camera_stopping:
@@ -346,6 +501,7 @@ class MainWindow(QMainWindow):
         self.capture_button.hide()
         self.close_camera_button.hide()
         self.webcam_button.setEnabled(True)
+        self._update_ocr_controls()
         worker.deleteLater()
         if self._closing:
             self.close()
@@ -367,19 +523,28 @@ class MainWindow(QMainWindow):
         message.exec()
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        if self._camera is None:
+        if self._camera is None and self._ocr_worker is None:
+            self._ocr_engine = None
             event.accept()
             return
-        # O encerramento aguarda a liberação pela própria thread, sem bloquear
-        # a interface nem destruir um QThread ainda em execução.
+        # As operações nativas terminam nas respectivas threads. A interface
+        # continua processando eventos até ambas liberarem seus recursos.
         event.ignore()
         self._closing = True
         self._stop_camera()
+        if self._ocr_worker is not None:
+            self._ocr_worker.requestInterruption()
+        self._update_ocr_controls()
 
     def _remove_selected(self) -> None:
         row = self.document_list.currentRow()
         if row < 0:
             return
+        if (
+            self._ocr_worker is not None
+            and self.current_document.id == self._ocr_worker.document_id
+        ):
+            self._ocr_worker.requestInterruption()
         with QSignalBlocker(self.document_list):
             self.document_list.takeItem(row)
             if self.document_list.count():
@@ -387,6 +552,8 @@ class MainWindow(QMainWindow):
         self._show_selected()
 
     def _clear_documents(self) -> None:
+        if self._ocr_worker is not None:
+            self._ocr_worker.requestInterruption()
         with QSignalBlocker(self.document_list):
             self.document_list.clear()
         self._show_selected()

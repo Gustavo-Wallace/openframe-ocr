@@ -2,7 +2,6 @@
 
 import gc
 from threading import Event, get_ident
-from time import monotonic
 from types import SimpleNamespace
 import weakref
 
@@ -10,11 +9,11 @@ import numpy as np
 import pytest
 from PySide6.QtCore import QTimer
 from PySide6.QtGui import QColor, QImage
-from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QMessageBox
 
 from openframe_ocr import camera, main_window
 from openframe_ocr.camera import CameraError, CameraWorker, frame_to_image
+from openframe_ocr.ocr import OCRResult
 
 
 class FakeCapture:
@@ -53,19 +52,6 @@ class FakeCapture:
         self.release_count += 1
         self.release_thread = get_ident()
         self.released.set()
-
-
-@pytest.fixture
-def wait_for(application):
-    def wait(condition, timeout=3):
-        deadline = monotonic() + timeout
-        while not condition() and monotonic() < deadline:
-            application.processEvents()
-            QTest.qWait(5)
-        application.processEvents()
-        assert condition(), "A condição esperada não ocorreu dentro do prazo."
-
-    return wait
 
 
 @pytest.fixture
@@ -457,3 +443,71 @@ def test_live_preview_preserves_aspect_ratio_at_both_window_sizes(rig, wait_for,
         assert 0 < pixmap.width() <= available.width()
         assert 0 < pixmap.height() <= available.height()
         assert abs(pixmap.width() * 120 - pixmap.height() * 160) <= 160
+
+
+def test_ocr_completion_does_not_replace_live_camera_preview(rig, wait_for, tmp_path):
+    window = rig.window
+    path = make_import(tmp_path)
+    window.add_images([path])
+    started = Event()
+    gate = Event()
+
+    class FakeOCR:
+        def recognize(self, path, image):
+            started.set()
+            assert gate.wait(3)
+            return OCRResult("Informação sintética", "completed")
+
+    window._ocr_engine = FakeOCR()
+    try:
+        window.extract_button.click()
+        wait_for(started.is_set)
+        window.webcam_button.click()
+        wait_for(lambda: window.capture_button.isEnabled())
+        gate.set()
+        wait_for(lambda: window._ocr_worker is None)
+
+        assert window.text_edit.toPlainText() == "Informação sintética"
+        assert displayed_color(window) == QColor("red")
+        assert not window.extract_button.isEnabled()
+        window.capture_button.click()
+        wait_for(lambda: window._camera is None)
+        assert window.current_document.recognized_text is None
+        assert window.text_edit.toPlainText() == ""
+        assert window._ocr_worker is None
+    finally:
+        gate.set()
+        wait_for(lambda: window._ocr_worker is None)
+
+
+def test_closing_with_camera_and_ocr_active_waits_for_both(rig, wait_for, tmp_path):
+    window = rig.window
+    window.add_images([make_import(tmp_path)])
+    started = Event()
+    gate = Event()
+
+    class FakeOCR:
+        def recognize(self, path, image):
+            started.set()
+            assert gate.wait(3)
+            return OCRResult("Conteúdo sintético", "completed")
+
+    window._ocr_engine = FakeOCR()
+    try:
+        window.extract_button.click()
+        wait_for(started.is_set)
+        window.webcam_button.click()
+        wait_for(lambda: window.capture_button.isEnabled())
+        rig.next_capture.read_gate.clear()
+        wait_for(rig.next_capture.read_blocked.is_set)
+        assert not window.close()
+        gate.set()
+        wait_for(lambda: window._ocr_worker is None)
+        assert window.isVisible() and window._camera is not None
+        rig.next_capture.read_gate.set()
+        wait_for(lambda: window._camera is None and not window.isVisible())
+        assert rig.next_capture.release_count == 1
+    finally:
+        gate.set()
+        rig.next_capture.read_gate.set()
+        wait_for(lambda: window._ocr_worker is None and window._camera is None)

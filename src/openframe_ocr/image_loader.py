@@ -1,4 +1,4 @@
-"""Leitura local de PNG/JPEG com limites para a pré-visualização."""
+"""Leitura local de PNG/JPEG com limites de tamanho e memória."""
 
 from pathlib import Path
 
@@ -12,8 +12,8 @@ MAX_ALLOCATION_MIB = 128
 MAX_PREVIEW_EDGE = 1600
 
 
-def load_preview(path: Path) -> QImage:
-    """Valida o conteúdo e retorna uma prévia, preservando o arquivo original."""
+def load_image(path: Path, *, preview: bool = False) -> QImage:
+    """Lê o original ou uma prévia reduzida, sem modificar o arquivo."""
     if path.suffix.lower() not in {".png", ".jpg", ".jpeg"}:
         raise ValueError("Formato não suportado. Use PNG ou JPEG.")
 
@@ -46,7 +46,7 @@ def load_preview(path: Path) -> QImage:
     if size.width() * size.height() > MAX_IMAGE_PIXELS:
         raise ValueError("A imagem excede o limite de 32 milhões de pixels.")
 
-    if max(size.width(), size.height()) > MAX_PREVIEW_EDGE:
+    if preview and max(size.width(), size.height()) > MAX_PREVIEW_EDGE:
         preview_size = size.scaled(
             QSize(MAX_PREVIEW_EDGE, MAX_PREVIEW_EDGE),
             Qt.AspectRatioMode.KeepAspectRatio,
@@ -63,3 +63,8 @@ def load_preview(path: Path) -> QImage:
             "ou exceder o limite de memória."
         )
     return image
+
+
+def load_preview(path: Path) -> QImage:
+    """Valida a imagem e retorna sua representação limitada para exibição."""
+    return load_image(path, preview=True)
