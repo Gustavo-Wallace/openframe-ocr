@@ -28,6 +28,20 @@ class Document:
     quality_result: QualityResult | None = None
     quality_status: str = "idle"
     quality_error: str = ""
+    text_revision: int = 0
+    summary: str = ""
+    summary_source_revision: int | None = None
+    summary_status: str = "idle"
+    summary_error: str = ""
+
+    def set_text(self, text: str) -> None:
+        if self.text != text:
+            self.text = text
+            self.text_revision += 1
+
+    @property
+    def summary_stale(self) -> bool:
+        return bool(self.summary) and self.summary_source_revision != self.text_revision
 
     @property
     def is_edited(self) -> bool:

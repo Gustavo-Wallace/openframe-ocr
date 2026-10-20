@@ -25,10 +25,12 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from openframe_ocr.assistant_panel import AssistantPanel
 from openframe_ocr.camera import CameraWorker
 from openframe_ocr.document import Document
 from openframe_ocr.fields_panel import FieldsPanel
 from openframe_ocr.image_loader import MAX_PREVIEW_EDGE, load_preview
+from openframe_ocr.local_llm import LocalLLMClient
 from openframe_ocr.ocr import OCREngine, OCRWorker
 from openframe_ocr.quality_panel import QualityPanel
 from openframe_ocr.quality_worker import QualityWorker
@@ -98,6 +100,8 @@ class MainWindow(QMainWindow):
         self._ocr_engine: OCREngine | None = None
         self._ocr_worker: OCRWorker | None = None
         self._quality_worker: QualityWorker | None = None
+        self._llm = LocalLLMClient(self)
+        self._summary_request: tuple[str, str, int] | None = None
         self._frame_timer = QTimer(self)
         self._frame_timer.setInterval(33)
         self._frame_timer.timeout.connect(self._update_camera_preview)
@@ -205,6 +209,13 @@ class MainWindow(QMainWindow):
         self.quality_panel.analyze_button.clicked.connect(self._start_quality)
         self.quality_panel.expanded.connect(self._expand_fields_space)
         text_layout.addWidget(self.quality_panel)
+        self.assistant_panel = AssistantPanel(self._llm)
+        self.assistant_panel.expanded.connect(self._expand_fields_space)
+        self.assistant_panel.summarize_button.clicked.connect(self._start_summary)
+        self._llm.changed.connect(self._update_assistant_controls)
+        self._llm.summary_ready.connect(self._summary_finished)
+        self._llm.failed.connect(self._summary_failed)
+        text_layout.addWidget(self.assistant_panel)
         self.text_scroll = QScrollArea()
         self.text_scroll.setFrameShape(QFrame.Shape.NoFrame)
         self.text_scroll.setWidgetResizable(True)
@@ -232,7 +243,8 @@ class MainWindow(QMainWindow):
         super().resizeEvent(event)
         extra_height = max(0, event.size().height() - self.minimumHeight())
         self.preview.setMinimumHeight(min(150, 60 + extra_height // 2))
-        if self.fields_panel.toggle.isChecked() or self.quality_panel.toggle.isChecked():
+        if (self.fields_panel.toggle.isChecked() or self.quality_panel.toggle.isChecked()
+                or self.assistant_panel.toggle.isChecked()):
             QTimer.singleShot(0, self._expand_fields_space)
 
     @property
@@ -326,7 +338,7 @@ class MainWindow(QMainWindow):
         sizes = self.content_splitter.sizes()
         total = sum(sizes)
         preview_minimum = self.content_splitter.widget(0).minimumSizeHint().height()
-        requested = total if self.quality_panel.toggle.isChecked() else 310
+        requested = total if (self.quality_panel.toggle.isChecked() or self.assistant_panel.toggle.isChecked()) else 310
         text_size = max(0, min(max(sizes[1], requested), total - preview_minimum))
         self.content_splitter.setSizes([total - text_size, text_size])
 
@@ -374,6 +386,55 @@ class MainWindow(QMainWindow):
         self.quality_panel.set_document(
             document, busy=self._quality_worker is not None, available=not self._closing,
         )
+        self._update_assistant_controls()
+
+    def _update_assistant_controls(self) -> None:
+        self.assistant_panel.update_state(self.current_document, available=not self._closing)
+
+    def _start_summary(self) -> None:
+        document = self.current_document
+        if (document is None or not document.text.strip() or self._llm.busy
+                or not self._llm.models or self._closing):
+            return
+        self._summary_request = (document.id, document.text, document.text_revision)
+        document.summary_status = "running"
+        document.summary_error = ""
+        self._llm.summarize(document.text, self.assistant_panel.model.currentData())
+
+    def _summary_document(self) -> Document | None:
+        if self._summary_request is None:
+            return None
+        return next((item for item in self.documents if item.id == self._summary_request[0]), None)
+
+    def _summary_finished(self, summary: str) -> None:
+        document = self._summary_document()
+        request = self._summary_request
+        self._summary_request = None
+        if document is not None and not self._closing:
+            if document.text == request[1] and document.text_revision == request[2]:
+                document.summary = summary
+                document.summary_source_revision = request[2]
+                document.summary_status = "completed"
+                document.summary_error = ""
+            else:
+                document.summary_status = "error"
+                document.summary_error = "Texto alterado durante a geração. Resultado descartado; gere um novo resumo."
+        self._update_assistant_controls()
+
+    def _summary_failed(self, message: str) -> None:
+        document = self._summary_document()
+        self._summary_request = None
+        if document is not None:
+            document.summary_status = "error"
+            document.summary_error = message
+        self._update_assistant_controls()
+
+    def _cancel_summary(self) -> None:
+        document = self._summary_document()
+        self._summary_request = None
+        if document is not None:
+            document.summary_status = "completed" if document.summary else "idle"
+        self._llm.cancel()
 
     def _start_quality(self) -> None:
         document = self.current_document
@@ -414,7 +475,7 @@ class MainWindow(QMainWindow):
     def _text_edited(self) -> None:
         document = self.current_document
         if document is not None:
-            document.text = self.text_edit.toPlainText()
+            document.set_text(self.text_edit.toPlainText())
         self._update_ocr_controls()
 
     def _copy_text(self) -> None:
@@ -473,7 +534,7 @@ class MainWindow(QMainWindow):
         if document is not None:
             if worker.result is not None:
                 document.recognized_text = worker.result.text
-                document.text = worker.result.text
+                document.set_text(worker.result.text)
                 document.ocr_status = worker.result.status
             elif worker.error:
                 document.ocr_status = "error"
@@ -603,6 +664,8 @@ class MainWindow(QMainWindow):
         message.exec()
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        self._closing = True
+        self._cancel_summary()
         if self._camera is None and self._ocr_worker is None and self._quality_worker is None:
             self._ocr_engine = None
             event.accept()
@@ -610,7 +673,6 @@ class MainWindow(QMainWindow):
         # As operações nativas terminam nas respectivas threads. A interface
         # continua processando eventos até ambas liberarem seus recursos.
         event.ignore()
-        self._closing = True
         self._stop_camera()
         if self._ocr_worker is not None:
             self._ocr_worker.requestInterruption()
@@ -622,6 +684,8 @@ class MainWindow(QMainWindow):
         row = self.document_list.currentRow()
         if row < 0:
             return
+        if self._summary_request is not None and self.current_document.id == self._summary_request[0]:
+            self._cancel_summary()
         if self._quality_worker is not None and self.current_document.id == self._quality_worker.document_id:
             self._quality_worker.requestInterruption()
         if (
@@ -636,6 +700,8 @@ class MainWindow(QMainWindow):
         self._show_selected()
 
     def _clear_documents(self) -> None:
+        if self._summary_request is not None:
+            self._cancel_summary()
         if self._quality_worker is not None:
             self._quality_worker.requestInterruption()
         if self._ocr_worker is not None:
