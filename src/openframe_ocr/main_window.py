@@ -30,7 +30,8 @@ from openframe_ocr.camera import CameraWorker
 from openframe_ocr.document import Document
 from openframe_ocr.fields_panel import FieldsPanel
 from openframe_ocr.image_loader import MAX_PREVIEW_EDGE, load_preview
-from openframe_ocr.local_llm import LocalLLMClient
+from openframe_ocr.local_llm import LLMError, LocalLLMClient, validate_summary_text
+from openframe_ocr.llm_runtime import LLMRuntime, RuntimeConfig, RuntimeState
 from openframe_ocr.ocr import OCREngine, OCRWorker
 from openframe_ocr.quality_panel import QualityPanel
 from openframe_ocr.quality_worker import QualityWorker
@@ -86,7 +87,7 @@ class ImagePreview(QLabel):
 class MainWindow(QMainWindow):
     """Apresenta documentos importados, capturas em memória e a prévia da webcam."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, runtime_config: RuntimeConfig | None = None) -> None:
         super().__init__()
         self.setWindowTitle("OpenFrame OCR")
         self.resize(900, 600)
@@ -101,6 +102,7 @@ class MainWindow(QMainWindow):
         self._ocr_worker: OCRWorker | None = None
         self._quality_worker: QualityWorker | None = None
         self._llm = LocalLLMClient(self)
+        self._runtime = LLMRuntime(self._llm, runtime_config, self)
         self._summary_request: tuple[str, str, int] | None = None
         self._frame_timer = QTimer(self)
         self._frame_timer.setInterval(33)
@@ -209,12 +211,15 @@ class MainWindow(QMainWindow):
         self.quality_panel.analyze_button.clicked.connect(self._start_quality)
         self.quality_panel.expanded.connect(self._expand_fields_space)
         text_layout.addWidget(self.quality_panel)
-        self.assistant_panel = AssistantPanel(self._llm)
+        self.assistant_panel = AssistantPanel(self._llm, self._runtime)
         self.assistant_panel.expanded.connect(self._expand_fields_space)
         self.assistant_panel.summarize_button.clicked.connect(self._start_summary)
         self._llm.changed.connect(self._update_assistant_controls)
         self._llm.summary_ready.connect(self._summary_finished)
         self._llm.failed.connect(self._summary_failed)
+        self._runtime.changed.connect(self._runtime_changed)
+        self._runtime.ready.connect(self._runtime_ready)
+        self._runtime.failed.connect(self._summary_failed)
         text_layout.addWidget(self.assistant_panel)
         self.text_scroll = QScrollArea()
         self.text_scroll.setFrameShape(QFrame.Shape.NoFrame)
@@ -393,13 +398,35 @@ class MainWindow(QMainWindow):
 
     def _start_summary(self) -> None:
         document = self.current_document
-        if (document is None or not document.text.strip() or self._llm.busy
-                or not self._llm.models or self._closing):
+        if (document is None or not document.text.strip() or self._llm.busy or self._summary_request is not None
+                or not self._runtime.can_request or self._closing):
+            return
+        try:
+            validate_summary_text(document.text)
+        except LLMError as error:
+            document.summary_error = str(error)
+            document.summary_status = "error"
+            self._update_assistant_controls()
             return
         self._summary_request = (document.id, document.text, document.text_revision)
         document.summary_status = "running"
         document.summary_error = ""
-        self._llm.summarize(document.text, self.assistant_panel.model.currentData())
+        self._runtime.ensure_ready()
+
+    def _runtime_changed(self) -> None:
+        self._update_assistant_controls()
+        if self._closing and not self._runtime.active:
+            QTimer.singleShot(0, self.close)
+
+    def _runtime_ready(self) -> None:
+        document = self._summary_document()
+        request = self._summary_request
+        if document is None or self._closing:
+            return
+        if document.text != request[1] or document.text_revision != request[2]:
+            self._summary_failed("Texto alterado durante a preparação. Solicitação descartada; gere um novo resumo.")
+            return
+        self._llm.summarize(request[1], self._runtime.model_id)
 
     def _summary_document(self) -> Document | None:
         if self._summary_request is None:
@@ -434,6 +461,8 @@ class MainWindow(QMainWindow):
         self._summary_request = None
         if document is not None:
             document.summary_status = "completed" if document.summary else "idle"
+        if self._runtime.state == RuntimeState.STARTING:
+            self._runtime.stop()
         self._llm.cancel()
 
     def _start_quality(self) -> None:
@@ -666,7 +695,10 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event: QCloseEvent) -> None:
         self._closing = True
         self._cancel_summary()
-        if self._camera is None and self._ocr_worker is None and self._quality_worker is None:
+        if self._runtime.active or self._runtime.state == RuntimeState.STARTING:
+            self._runtime.stop()
+        if (self._camera is None and self._ocr_worker is None and self._quality_worker is None
+                and not self._runtime.active):
             self._ocr_engine = None
             event.accept()
             return

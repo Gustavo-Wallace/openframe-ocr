@@ -47,7 +47,7 @@ def test_unavailable_server_has_localized_error_without_retry(client, wait_for, 
     client.connect_server(port)
     wait_for(lambda: not client.busy, timeout=7)
     assert errors == [client.status]
-    assert "IA local indisponível" in client.status and "llama.cpp" in client.status
+    assert "IA local indisponível" in client.status
     assert caplog.text == ""
 
 

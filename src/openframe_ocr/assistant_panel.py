@@ -1,13 +1,14 @@
 """Seção opcional de resumos locais, integrada à rolagem da transcrição."""
 
-from PySide6.QtCore import Qt, QSignalBlocker, Signal
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
-    QComboBox, QHBoxLayout, QLabel, QPlainTextEdit, QPushButton, QSizePolicy,
-    QSpinBox, QToolButton, QVBoxLayout, QWidget,
+    QHBoxLayout, QLabel, QPlainTextEdit, QPushButton, QSizePolicy,
+    QToolButton, QVBoxLayout, QWidget,
 )
 
 from openframe_ocr.document import Document
 from openframe_ocr.local_llm import LocalLLMClient
+from openframe_ocr.llm_runtime import LLMRuntime, RuntimeState
 
 
 class _WrappedLabel(QLabel):
@@ -19,9 +20,10 @@ class _WrappedLabel(QLabel):
 class AssistantPanel(QWidget):
     expanded = Signal()
 
-    def __init__(self, client: LocalLLMClient, parent=None):
+    def __init__(self, client: LocalLLMClient, runtime: LLMRuntime, parent=None):
         super().__init__(parent)
         self.client = client
+        self.runtime = runtime
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(6)
@@ -39,32 +41,7 @@ class AssistantPanel(QWidget):
         body = QVBoxLayout(self.body)
         body.setContentsMargins(0, 0, 0, 0)
         body.setSpacing(6)
-        connection = QHBoxLayout()
-        port_label = QLabel("Porta local:")
-        connection.addWidget(port_label)
-        self.port = QSpinBox()
-        self.port.setRange(1, 65535)
-        self.port.setValue(client.port)
-        self.port.setAccessibleName("Porta do servidor local")
-        port_label.setBuddy(self.port)
-        self.port.valueChanged.connect(client.set_port)
-        connection.addWidget(self.port)
-        self.connect_button = QPushButton("Conectar")
-        self.connect_button.clicked.connect(lambda: client.connect_server(self.port.value()))
-        connection.addWidget(self.connect_button)
-        connection.addStretch()
-        body.addLayout(connection)
-        self.connection_status = self._label(client.status, body)
-        self.model_row = QWidget()
-        models = QHBoxLayout(self.model_row)
-        models.setContentsMargins(0, 0, 0, 0)
-        models.addWidget(QLabel("Modelo:"))
-        self.model = QComboBox()
-        self.model.setMinimumWidth(0)
-        self.model.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
-        self.model.setAccessibleName("Modelo local para resumo")
-        models.addWidget(self.model, stretch=1)
-        body.addWidget(self.model_row)
+        self.runtime_status = self._label(runtime.status, body)
         self.summarize_button = QPushButton("Resumir documento")
         body.addWidget(self.summarize_button, alignment=Qt.AlignmentFlag.AlignLeft)
         self.status = self._label("Selecione um documento para resumir.", body)
@@ -76,10 +53,9 @@ class AssistantPanel(QWidget):
         self.summary.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         body.addWidget(self.summary)
         self._label("Resumo gerado por IA local. Revise as informações.", body)
-        self._label("Somente a transcrição atual é enviada ao servidor local.", body)
+        self._label("Somente a transcrição atual é usada no resumo local.", body)
         layout.addWidget(self.body)
         self.body.hide()
-        self.model_row.hide()
         self.summarize_button.setEnabled(False)
 
     def _label(self, text, layout):
@@ -97,25 +73,18 @@ class AssistantPanel(QWidget):
 
     def update_state(self, document: Document | None, *, available=True):
         client = self.client
-        self.port.setEnabled(available and not client.busy)
-        self.connect_button.setEnabled(available and not client.busy)
-        self.model.setEnabled(available and not client.busy)
-        current_models = tuple(self.model.itemData(index) for index in range(self.model.count()))
-        if current_models != client.models:
-            with QSignalBlocker(self.model):
-                self.model.clear()
-                for model in client.models:
-                    self.model.addItem(model, model)
-        self.model_row.setVisible(len(client.models) > 1)
-        self.connection_status.setText(client.status)
+        self.runtime_status.setText(self.runtime.status)
         self.summarize_button.setEnabled(
             available and document is not None and bool(document.text.strip())
-            and bool(client.models) and not client.busy
+            and self.runtime.can_request and not client.busy
         )
         if document is None:
             message = "Selecione um documento para resumir."
         elif document.summary_status == "running":
-            message = "Gerando resumo desta transcrição..."
+            message = (
+                "Preparando IA para resumir esta transcrição..."
+                if self.runtime.state == RuntimeState.STARTING else "Gerando resumo desta transcrição..."
+            )
             if document.summary_stale:
                 message += " O resumo anterior está desatualizado."
         elif document.summary_stale:

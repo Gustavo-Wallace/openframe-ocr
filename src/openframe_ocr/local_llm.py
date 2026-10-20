@@ -10,8 +10,8 @@ from PySide6.QtNetwork import QNetworkAccessManager, QNetworkProxy, QNetworkRepl
 
 MAX_INPUT_CHARACTERS = 4000
 MAX_RESPONSE_BYTES = 1024 * 1024
-UNAVAILABLE_MESSAGE = "IA local indisponível. Inicie um servidor llama.cpp para utilizar os resumos."
-LOADING_MESSAGE = "O servidor local está carregando o modelo. Aguarde e conecte novamente."
+UNAVAILABLE_MESSAGE = "IA local indisponível. Tente resumir novamente."
+LOADING_MESSAGE = "O modelo da IA local ainda está carregando. Tente resumir novamente."
 TIMEOUT_MESSAGE = "O tempo de espera da IA local foi excedido. Tente novamente."
 INPUT_LIMIT_MESSAGE = (
     "A transcrição excede o limite inicial de 4.000 caracteres. "
@@ -34,10 +34,7 @@ class LLMError(Exception):
 
 
 def summary_payload(text: str, model: str) -> dict:
-    if not text.strip():
-        raise LLMError("A transcrição está vazia. Extraia ou edite o texto antes de resumir.")
-    if len(text) > MAX_INPUT_CHARACTERS:
-        raise LLMError(INPUT_LIMIT_MESSAGE)
+    validate_summary_text(text)
     delimiter = "transcricao_" + uuid4().hex
     return {
         "model": model,
@@ -50,6 +47,13 @@ def summary_payload(text: str, model: str) -> dict:
         "top_p": 0.9,
         "max_tokens": 384,
     }
+
+
+def validate_summary_text(text: str) -> None:
+    if not text.strip():
+        raise LLMError("A transcrição está vazia. Extraia ou edite o texto antes de resumir.")
+    if len(text) > MAX_INPUT_CHARACTERS:
+        raise LLMError(INPUT_LIMIT_MESSAGE)
 
 
 def parse_models(data) -> tuple[str, ...]:
@@ -102,12 +106,16 @@ class LocalLLMClient(QObject):
     changed = Signal()
     summary_ready = Signal(str)
     failed = Signal(str)
+    models_ready = Signal()
+    connection_lost = Signal()
 
     def __init__(self, parent=None, *, connection_timeout_ms=5000, generation_timeout_ms=120000):
         super().__init__(parent)
         self.port = 8080
+        self._token = ""
+        self._connection_guard = None
         self.models: tuple[str, ...] = ()
-        self.status = "Não conectado. Clique em Conectar para verificar a IA local."
+        self.status = "IA local ainda não preparada."
         self._manager = QNetworkAccessManager(self)
         self._manager.setProxy(QNetworkProxy(QNetworkProxy.ProxyType.NoProxy))
         self._manager.setRedirectPolicy(QNetworkRequest.RedirectPolicy.ManualRedirectPolicy)
@@ -132,7 +140,7 @@ class LocalLLMClient(QObject):
             return
         self.port = port
         self.models = ()
-        self.status = "Não conectado. Clique em Conectar para verificar a IA local."
+        self.status = "IA local ainda não preparada."
         self.changed.emit()
 
     def connect_server(self, port: int) -> None:
@@ -142,24 +150,43 @@ class LocalLLMClient(QObject):
         self.models = ()
         self._start("models", "/v1/models", None, self.connection_timeout_ms)
 
+    def configure_managed(self, port: int, token: str, guard) -> None:
+        self.cancel()
+        self.set_port(port)
+        self.models = ()
+        self._token = token
+        self._connection_guard = guard
+
+    def clear_managed(self) -> None:
+        self._token = ""
+        self.models = ()
+        self._connection_guard = lambda: False
+        self._manager.clearConnectionCache()
+
     def summarize(self, text: str, model: str) -> None:
         if self.busy:
             return
         try:
             payload = summary_payload(text, model)
             if model not in self.models:
-                raise LLMError("Conecte a IA local e selecione um modelo disponível antes de resumir.")
+                raise LLMError("A IA local ainda não está pronta para resumir. Tente novamente.")
         except LLMError as error:
             self._fail(str(error))
             return
         self._start("summary", "/v1/chat/completions", payload, self.generation_timeout_ms)
 
     def _start(self, operation, path, payload, timeout_ms) -> None:
+        if self._connection_guard is not None and not self._connection_guard():
+            self.connection_lost.emit()
+            self._fail(UNAVAILABLE_MESSAGE)
+            return
         # A URL não vem da interface nem dos metadados do servidor.
         request = QNetworkRequest(QUrl(f"http://127.0.0.1:{self.port}{path}"))
         request.setAttribute(QNetworkRequest.Attribute.RedirectPolicyAttribute,
                              QNetworkRequest.RedirectPolicy.ManualRedirectPolicy)
         request.setRawHeader(b"Accept", b"application/json")
+        if self._token:
+            request.setRawHeader(b"Authorization", ("Bearer " + self._token).encode("ascii"))
         request.setTransferTimeout(timeout_ms)
         self._operation = operation
         self._buffer.clear()
@@ -222,12 +249,16 @@ class LocalLLMClient(QObject):
         except (ValueError, UnicodeError, RecursionError):
             self._fail("O servidor local retornou uma resposta inválida.")
         except LLMError as error:
+            if status is None or status == 401 or reply.error() == QNetworkReply.NetworkError.TimeoutError:
+                self.connection_lost.emit()
             self._fail(str(error))
         else:
             self.status = "IA local conectada."
             self.changed.emit()
             if summary is not None:
                 self.summary_ready.emit(summary)
+            else:
+                self.models_ready.emit()
         finally:
             self._buffer.clear()
             reply.deleteLater()

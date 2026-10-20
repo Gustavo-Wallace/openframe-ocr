@@ -8,11 +8,12 @@ import pytest
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QImage
 from PySide6.QtNetwork import QNetworkAccessManager
-from PySide6.QtWidgets import QApplication, QLabel, QLineEdit, QListWidgetItem
+from PySide6.QtWidgets import QApplication, QLabel, QLineEdit, QListWidgetItem, QSpinBox, QComboBox
 
 from openframe_ocr import camera
 from openframe_ocr.document import Document
 from openframe_ocr.local_llm import MAX_INPUT_CHARACTERS
+from openframe_ocr.llm_runtime import RuntimeState
 from openframe_ocr.main_window import MainWindow
 from openframe_ocr.ocr import OCRResult
 
@@ -21,7 +22,36 @@ TEXT = "Solicitação de material para o laboratório.\nProtocolo: TESTE-006\nMu
 
 
 @pytest.fixture
-def rig(window, llm_server, wait_for):
+def rig(window, llm_server, wait_for, runtime_bundle, monkeypatch):
+    # Estes testes isolam o estado dos documentos; QProcess real é coberto em test_llm_runtime.
+    runtime, client = window._runtime, window._llm
+    runtime.config = runtime_bundle.config
+    runtime.state = RuntimeState.STOPPED
+    runtime.status = "IA local disponível."
+    client.models_ready.disconnect(runtime._models_ready)
+    client.failed.disconnect(runtime._client_failed)
+    client.connection_lost.disconnect(runtime._connection_lost)
+
+    def models_ready():
+        runtime.model_id = client.models[0]
+        runtime._set_state(RuntimeState.READY, "IA pronta.")
+        runtime.ready.emit()
+
+    def ensure_ready():
+        if runtime.state == RuntimeState.READY and client.models:
+            runtime.ready.emit()
+        else:
+            runtime._set_state(RuntimeState.STARTING, "Carregando modelo...")
+            client.configure_managed(llm_server.port, "", lambda: True)
+            client.connect_server(llm_server.port)
+
+    def failed(message):
+        runtime._set_state(RuntimeState.ERROR, "Não foi possível iniciar a IA local.")
+
+    client.models_ready.connect(models_ready)
+    client.failed.connect(failed)
+    monkeypatch.setattr(runtime, "ensure_ready", ensure_ready)
+    window._update_assistant_controls()
     window.show()
 
     def add(text=TEXT, name="Documento sintético"):
@@ -46,8 +76,7 @@ def rig(window, llm_server, wait_for):
 def connect(rig, wait_for):
     panel = rig.panel
     panel.toggle.setChecked(True)
-    panel.port.setValue(rig.server.port)
-    panel.connect_button.click()
+    rig.window._runtime.ensure_ready()
     wait_for(lambda: not rig.window._llm.busy)
     assert rig.window._llm.models
 
@@ -73,8 +102,8 @@ def test_startup_and_expansion_do_not_contact_any_server(application, monkeypatc
     panel = window.assistant_panel
     assert not panel.toggle.isChecked() and not panel.body.isVisible()
     panel.toggle.click()
-    panel.port.setValue(8081)
     application.processEvents()
+    assert panel.findChildren(QSpinBox) == [] and panel.findChildren(QComboBox) == []
     assert panel.body.isVisible() and not panel.summarize_button.isEnabled()
     assert window.import_button.isEnabled() and window.webcam_button.isEnabled()
     assert window._ocr_engine is None and not window._llm.busy
@@ -123,21 +152,20 @@ def test_disabled_without_document_empty_text_or_while_generating(rig, wait_for)
     rig.panel.summarize_button.click()
     wait_for(lambda: len(rig.server.requests) == 2)
     assert not rig.panel.summarize_button.isEnabled()
-    assert not rig.panel.port.isEnabled() and not rig.panel.connect_button.isEnabled()
+    assert rig.window._runtime.state == RuntimeState.READY
     rig.window._start_summary()
     assert len(rig.server.requests) == 2
 
 
-def test_multiple_models_have_explicit_selection_and_port_change_requires_reconnect(rig, wait_for):
+def test_normal_ui_has_no_connection_port_or_model_selection_controls(rig, wait_for):
     rig.add()
     rig.server.responses["/v1/models"] = (200, {"data": [{"id": "modelo-a"}, {"id": "modelo-b"}]}, {})
     connect(rig, wait_for)
-    assert rig.panel.model_row.isVisible()
-    rig.panel.model.setCurrentIndex(1)
+    assert rig.panel.findChildren(QSpinBox) == []
+    assert rig.panel.findChildren(QComboBox) == []
+    assert not hasattr(rig.panel, "connect_button")
     summarize(rig, wait_for)
-    assert rig.server.requests[-1][2]["model"] == "modelo-b"
-    rig.panel.port.setValue(8081 if rig.server.port != 8081 else 8082)
-    assert not rig.panel.summarize_button.isEnabled()
+    assert rig.server.requests[-1][2]["model"] == "modelo-a"
     assert len(rig.server.requests) == 2
 
 
@@ -251,11 +279,10 @@ def test_unavailable_server_keeps_core_controls_usable(rig, wait_for):
     rig.add()
     rig.server.disconnect = True
     rig.panel.toggle.setChecked(True)
-    rig.panel.port.setValue(rig.server.port)
-    rig.panel.connect_button.click()
+    rig.window._runtime.ensure_ready()
     wait_for(lambda: not rig.window._llm.busy)
-    assert "IA local indisponível" in rig.panel.connection_status.text()
-    assert not rig.panel.summarize_button.isEnabled()
+    assert "Não foi possível iniciar" in rig.panel.runtime_status.text()
+    assert rig.panel.summarize_button.isEnabled()
     for control in [rig.window.import_button, rig.window.webcam_button, rig.window.extract_button,
                     rig.window.fields_panel.identify_button, rig.window.quality_panel.analyze_button]:
         assert control.isEnabled()
@@ -269,8 +296,7 @@ def test_close_abandons_pending_request_and_gui_remains_responsive(rig, wait_for
         connect(rig, wait_for)
     rig.server.gates[path] = Event()
     if operation == "models":
-        rig.panel.port.setValue(rig.server.port)
-        rig.panel.connect_button.click()
+        rig.window._runtime.ensure_ready()
     else:
         rig.panel.summarize_button.click()
     wait_for(lambda: any(request[1] == path for request in rig.server.requests))
@@ -307,8 +333,8 @@ def test_summary_is_selectable_plain_text_and_all_controls_are_scroll_accessible
             if label.isVisible():
                 wait_for(lambda: label.height() >= label.heightForWidth(label.width()))
         for control in [window.text_edit, window.extract_button, window.fields_panel.identify_button,
-                        window.quality_panel.analyze_button, rig.panel.toggle, rig.panel.port,
-                        rig.panel.connect_button, rig.panel.summarize_button, rig.panel.summary]:
+                        window.quality_panel.analyze_button, rig.panel.toggle,
+                        rig.panel.summarize_button, rig.panel.summary]:
             control.setFocus()
 
             def reveal():

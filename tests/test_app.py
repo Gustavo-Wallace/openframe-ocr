@@ -25,6 +25,7 @@ def test_imports_do_not_create_application():
             "import openframe_ocr.quality_worker; "
             "import openframe_ocr.local_llm; "
             "import openframe_ocr.assistant_panel; "
+            "import openframe_ocr.llm_runtime; "
             "import openframe_ocr.ocr; "
             "import openframe_ocr.__main__; "
             "assert QApplication.instance() is None; "
@@ -64,12 +65,10 @@ def test_initial_portuguese_labels(window):
         "Qualidade da imagem",
         "Selecione um documento para analisar a qualidade.",
         "Assistente de IA",
-        "Porta local:",
-        "Modelo:",
-        "Não conectado. Clique em Conectar para verificar a IA local.",
+        "IA não instalada.",
         "Selecione um documento para resumir.",
         "Resumo gerado por IA local. Revise as informações.",
-        "Somente a transcrição atual é enviada ao servidor local.",
+        "Somente a transcrição atual é usada no resumo local.",
     }
 
 
@@ -87,7 +86,7 @@ def test_initial_actions_have_correct_state(window, application):
         "Identificar campos",
         "Analisar qualidade",
     }
-    assert len(buttons) == 13
+    assert len(buttons) == 12
     assert window.import_button.isEnabled()
     assert window.webcam_button.isEnabled()
     assert not window.capture_button.isVisible()
@@ -105,4 +104,5 @@ def test_initial_actions_have_correct_state(window, application):
     assert not window.quality_panel.body.isVisible()
     assert not window.assistant_panel.body.isVisible()
     assert not window.assistant_panel.summarize_button.isEnabled()
-    assert window.assistant_panel.port.value() == 8080
+    assert not hasattr(window.assistant_panel, "port")
+    assert not hasattr(window.assistant_panel, "connect_button")

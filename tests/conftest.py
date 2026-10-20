@@ -46,7 +46,61 @@ def window(application, wait_for):
     yield main_window
     main_window.close()
     wait_for(lambda: main_window._camera is None and main_window._ocr_worker is None
-             and main_window._quality_worker is None and not main_window._llm.busy)
+             and main_window._quality_worker is None and not main_window._llm.busy
+             and not main_window._runtime.active)
+
+
+@pytest.fixture
+def runtime_bundle(tmp_path, monkeypatch):
+    import json
+    import struct
+    import sys
+    from types import SimpleNamespace
+    from PySide6.QtCore import QProcess
+    from openframe_ocr.llm_runtime import RuntimeConfig
+
+    folder = tmp_path / "IA local ação"
+    folder.mkdir()
+    model = folder / "modelo sintético.gguf"
+    # Artefato sintético não vazio, utilizado só pelo filho de teste, sem pesos reais.
+    model.write_bytes(b"GGUF" + struct.pack("<IQQ", 3, 0, 0) + b"synthetic runtime test")
+    control = folder / "server.json"
+    control.write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("OPENFRAME_TEST_CONFIG", str(control))
+    bundle = SimpleNamespace(config=RuntimeConfig(Path(sys._base_executable).resolve(), model),
+                             instances=[], exited=[], graceful=True)
+
+    class ServerProcess(QProcess):
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self.terminated = 0
+            self.killed = 0
+            self.launch_arguments = []
+            self.pid = 0
+            bundle.instances.append(self)
+            self.started.connect(lambda: setattr(self, "pid", self.processId()))
+            self.finished.connect(lambda code, status: bundle.exited.append(self.pid))
+
+        def start(self):
+            self.launch_arguments = self.arguments()
+            self.setArguments(["-u", str(Path(__file__).with_name("runtime_server.py")), *self.launch_arguments])
+            super().start()
+
+        def terminate(self):
+            self.terminated += 1
+            if bundle.graceful:
+                self.write(b"stop\n")
+            else:
+                super().terminate()
+
+        def kill(self):
+            self.killed += 1
+            super().kill()
+
+    bundle.process_factory = ServerProcess
+    bundle.set_options = lambda **options: control.write_text(json.dumps(options), encoding="utf-8")
+    bundle.requests = lambda: [json.loads(line) for line in control.with_suffix(".requests").read_text().splitlines()] if control.with_suffix(".requests").exists() else []
+    return bundle
 
 
 @pytest.fixture
