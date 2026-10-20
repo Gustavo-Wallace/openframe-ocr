@@ -30,6 +30,8 @@ from openframe_ocr.document import Document
 from openframe_ocr.fields_panel import FieldsPanel
 from openframe_ocr.image_loader import MAX_PREVIEW_EDGE, load_preview
 from openframe_ocr.ocr import OCREngine, OCRWorker
+from openframe_ocr.quality_panel import QualityPanel
+from openframe_ocr.quality_worker import QualityWorker
 
 
 MAX_CAPTURE_MEMORY_BYTES = 128 * 1024 * 1024
@@ -95,6 +97,7 @@ class MainWindow(QMainWindow):
         self._closing = False
         self._ocr_engine: OCREngine | None = None
         self._ocr_worker: OCRWorker | None = None
+        self._quality_worker: QualityWorker | None = None
         self._frame_timer = QTimer(self)
         self._frame_timer.setInterval(33)
         self._frame_timer.timeout.connect(self._update_camera_preview)
@@ -198,6 +201,10 @@ class MainWindow(QMainWindow):
         self.fields_panel = FieldsPanel()
         self.fields_panel.expanded.connect(self._expand_fields_space)
         text_layout.addWidget(self.fields_panel)
+        self.quality_panel = QualityPanel()
+        self.quality_panel.analyze_button.clicked.connect(self._start_quality)
+        self.quality_panel.expanded.connect(self._expand_fields_space)
+        text_layout.addWidget(self.quality_panel)
         self.text_scroll = QScrollArea()
         self.text_scroll.setFrameShape(QFrame.Shape.NoFrame)
         self.text_scroll.setWidgetResizable(True)
@@ -225,7 +232,7 @@ class MainWindow(QMainWindow):
         super().resizeEvent(event)
         extra_height = max(0, event.size().height() - self.minimumHeight())
         self.preview.setMinimumHeight(min(150, 60 + extra_height // 2))
-        if self.fields_panel.toggle.isChecked():
+        if self.fields_panel.toggle.isChecked() or self.quality_panel.toggle.isChecked():
             QTimer.singleShot(0, self._expand_fields_space)
 
     @property
@@ -319,7 +326,8 @@ class MainWindow(QMainWindow):
         sizes = self.content_splitter.sizes()
         total = sum(sizes)
         preview_minimum = self.content_splitter.widget(0).minimumSizeHint().height()
-        text_size = max(0, min(max(sizes[1], 310), total - preview_minimum))
+        requested = total if self.quality_panel.toggle.isChecked() else 310
+        text_size = max(0, min(max(sizes[1], requested), total - preview_minimum))
         self.content_splitter.setSizes([total - text_size, text_size])
 
     def _update_ocr_controls(self) -> None:
@@ -363,6 +371,45 @@ class MainWindow(QMainWindow):
             available=not self._closing,
             running=worker is not None and document is not None and worker.document_id == document.id,
         )
+        self.quality_panel.set_document(
+            document, busy=self._quality_worker is not None, available=not self._closing,
+        )
+
+    def _start_quality(self) -> None:
+        document = self.current_document
+        if document is None or self._quality_worker is not None or self._closing:
+            return
+        document.quality_status = "running"
+        document.quality_error = ""
+        self._quality_worker = QualityWorker(document.id, document.path, document.image, self)
+        self._quality_worker.finished.connect(
+            self._quality_finished, Qt.ConnectionType.QueuedConnection,
+        )
+        self._update_ocr_controls()
+        self._quality_worker.start()
+
+    @Slot()
+    def _quality_finished(self) -> None:
+        worker = self._quality_worker
+        if worker is None or self.sender() is not worker:
+            return
+        self._quality_worker = None
+        document = next((item for item in self.documents if item.id == worker.document_id), None)
+        if document is not None:
+            if worker.result is not None:
+                document.quality_result = worker.result
+                document.quality_status = "completed"
+                document.quality_error = ""
+            elif worker.error:
+                document.quality_status = "error"
+                document.quality_error = worker.error
+            else:
+                document.quality_status = "completed" if document.quality_result else "idle"
+        worker.deleteLater()
+        if self._closing:
+            self.close()
+        else:
+            self._update_ocr_controls()
 
     def _text_edited(self) -> None:
         document = self.current_document
@@ -556,7 +603,7 @@ class MainWindow(QMainWindow):
         message.exec()
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        if self._camera is None and self._ocr_worker is None:
+        if self._camera is None and self._ocr_worker is None and self._quality_worker is None:
             self._ocr_engine = None
             event.accept()
             return
@@ -567,12 +614,16 @@ class MainWindow(QMainWindow):
         self._stop_camera()
         if self._ocr_worker is not None:
             self._ocr_worker.requestInterruption()
+        if self._quality_worker is not None:
+            self._quality_worker.requestInterruption()
         self._update_ocr_controls()
 
     def _remove_selected(self) -> None:
         row = self.document_list.currentRow()
         if row < 0:
             return
+        if self._quality_worker is not None and self.current_document.id == self._quality_worker.document_id:
+            self._quality_worker.requestInterruption()
         if (
             self._ocr_worker is not None
             and self.current_document.id == self._ocr_worker.document_id
@@ -585,6 +636,8 @@ class MainWindow(QMainWindow):
         self._show_selected()
 
     def _clear_documents(self) -> None:
+        if self._quality_worker is not None:
+            self._quality_worker.requestInterruption()
         if self._ocr_worker is not None:
             self._ocr_worker.requestInterruption()
         with QSignalBlocker(self.document_list):

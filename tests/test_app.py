@@ -20,6 +20,9 @@ def test_imports_do_not_create_application():
             "import openframe_ocr.document; "
             "import openframe_ocr.fields; "
             "import openframe_ocr.fields_panel; "
+            "import openframe_ocr.image_quality; "
+            "import openframe_ocr.quality_panel; "
+            "import openframe_ocr.quality_worker; "
             "import openframe_ocr.ocr; "
             "import openframe_ocr.__main__; "
             "assert QApplication.instance() is None; "
@@ -56,6 +59,8 @@ def test_initial_portuguese_labels(window):
         "Selecione um documento para extrair texto.",
         "Selecione um documento para identificar campos.",
         "Campos identificados",
+        "Qualidade da imagem",
+        "Selecione um documento para analisar a qualidade.",
     }
 
 
@@ -71,8 +76,9 @@ def test_initial_actions_have_correct_state(window, application):
         "Extrair texto",
         "Copiar texto",
         "Identificar campos",
+        "Analisar qualidade",
     }
-    assert len(buttons) == 10
+    assert len(buttons) == 11
     assert window.import_button.isEnabled()
     assert window.webcam_button.isEnabled()
     assert not window.capture_button.isVisible()
@@ -86,3 +92,5 @@ def test_initial_actions_have_correct_state(window, application):
     assert not window.fields_panel.identify_button.isEnabled()
     assert not window.fields_panel.add_button.isEnabled()
     assert not window.fields_panel.body.isVisible()
+    assert not window.quality_panel.analyze_button.isEnabled()
+    assert not window.quality_panel.body.isVisible()

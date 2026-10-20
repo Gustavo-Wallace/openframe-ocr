@@ -45,7 +45,8 @@ def window(application, wait_for):
     main_window = MainWindow()
     yield main_window
     main_window.close()
-    wait_for(lambda: main_window._camera is None and main_window._ocr_worker is None)
+    wait_for(lambda: main_window._camera is None and main_window._ocr_worker is None
+             and main_window._quality_worker is None)
 
 
 @pytest.fixture

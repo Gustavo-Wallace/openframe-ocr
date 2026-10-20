@@ -7,6 +7,7 @@ from uuid import uuid4
 from PySide6.QtGui import QImage
 
 from openframe_ocr.fields import StructuredField
+from openframe_ocr.image_quality import QualityResult
 
 
 @dataclass
@@ -24,6 +25,9 @@ class Document:
     fields: list[StructuredField] = field(default_factory=list)
     fields_source_text: str | None = None
     fields_modified: bool = False
+    quality_result: QualityResult | None = None
+    quality_status: str = "idle"
+    quality_error: str = ""
 
     @property
     def is_edited(self) -> bool:
